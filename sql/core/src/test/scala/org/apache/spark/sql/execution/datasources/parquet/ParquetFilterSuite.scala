@@ -29,6 +29,7 @@ import org.apache.spark.SparkException
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.optimizer.InferFiltersFromConstraints
 import org.apache.spark.sql.catalyst.planning.PhysicalOperation
 import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.functions._
@@ -91,6 +92,10 @@ class ParquetFilterSuite extends QueryTest with ParquetTest with SharedSQLContex
       SQLConf.PARQUET_FILTER_PUSHDOWN_TIMESTAMP_ENABLED.key -> "true",
       SQLConf.PARQUET_FILTER_PUSHDOWN_DECIMAL_ENABLED.key -> "true",
       SQLConf.PARQUET_FILTER_PUSHDOWN_STRING_STARTSWITH_ENABLED.key -> "true",
+      // Disable adding filters from constraints because it adds, for instance,
+      // is-not-null to pushed filters, which makes it hard to test if the pushed
+      // filter is expected or not (this had to be fixed with SPARK-13495).
+      SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> InferFiltersFromConstraints.ruleName,
       SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "false") {
         val query = df
           .select(output.map(e => Column(e)): _*)
@@ -109,13 +114,16 @@ class ParquetFilterSuite extends QueryTest with ParquetTest with SharedSQLContex
           DataSourceStrategy.selectFilters(maybeRelation.get, maybeAnalyzedPredicate.toSeq)
         assert(selectedFilters.nonEmpty, "No filter is pushed down")
 
-        selectedFilters.foreach { pred =>
+        val pushedParquetFilters = selectedFilters.map { pred =>
           val maybeFilter = parquetFilters.createFilter(
             new SparkToParquetSchemaConverter(conf).convert(df.schema), pred)
           assert(maybeFilter.isDefined, s"Couldn't generate filter predicate for $pred")
-          // Doesn't bother checking type parameters here (e.g. `Eq[Integer]`)
-          maybeFilter.exists(_.getClass === filterClass)
+          maybeFilter.get
         }
+        // Doesn't bother checking type parameters here (e.g. `Eq[Integer]`)
+        assert(pushedParquetFilters.exists(_.getClass === filterClass),
+          s"${pushedParquetFilters.map(_.getClass).toList} did not contain ${filterClass}.")
+
         checker(stripSparkFilter(query), expected)
     }
   }
@@ -524,41 +532,40 @@ class ParquetFilterSuite extends QueryTest with ParquetTest with SharedSQLContex
   }
 
   test("filter pushdown - decimal") {
-    Seq(true, false).foreach { legacyFormat =>
+    Seq(
+      (false, Decimal.MAX_INT_DIGITS), // int32Writer
+      (false, Decimal.MAX_LONG_DIGITS), // int64Writer
+      (true, Decimal.MAX_LONG_DIGITS), // binaryWriterUsingUnscaledLong
+      (false, DecimalType.MAX_PRECISION) // binaryWriterUsingUnscaledBytes
+    ).foreach { case (legacyFormat, precision) =>
       withSQLConf(SQLConf.PARQUET_WRITE_LEGACY_FORMAT.key -> legacyFormat.toString) {
-        Seq(
-          s"a decimal(${Decimal.MAX_INT_DIGITS}, 2)",  // 32BitDecimalType
-          s"a decimal(${Decimal.MAX_LONG_DIGITS}, 2)", // 64BitDecimalType
-          "a decimal(38, 18)"                          // ByteArrayDecimalType
-        ).foreach { schemaDDL =>
-          val schema = StructType.fromDDL(schemaDDL)
-          val rdd =
-            spark.sparkContext.parallelize((1 to 4).map(i => Row(new java.math.BigDecimal(i))))
-          val dataFrame = spark.createDataFrame(rdd, schema)
-          testDecimalPushDown(dataFrame) { implicit df =>
-            assert(df.schema === schema)
-            checkFilterPredicate('a.isNull, classOf[Eq[_]], Seq.empty[Row])
-            checkFilterPredicate('a.isNotNull, classOf[NotEq[_]], (1 to 4).map(Row.apply(_)))
+        val schema = StructType.fromDDL(s"a decimal($precision, 2)")
+        val rdd =
+          spark.sparkContext.parallelize((1 to 4).map(i => Row(new java.math.BigDecimal(i))))
+        val dataFrame = spark.createDataFrame(rdd, schema)
+        testDecimalPushDown(dataFrame) { implicit df =>
+          assert(df.schema === schema)
+          checkFilterPredicate('a.isNull, classOf[Eq[_]], Seq.empty[Row])
+          checkFilterPredicate('a.isNotNull, classOf[NotEq[_]], (1 to 4).map(Row.apply(_)))
 
-            checkFilterPredicate('a === 1, classOf[Eq[_]], 1)
-            checkFilterPredicate('a <=> 1, classOf[Eq[_]], 1)
-            checkFilterPredicate('a =!= 1, classOf[NotEq[_]], (2 to 4).map(Row.apply(_)))
+          checkFilterPredicate('a === 1, classOf[Eq[_]], 1)
+          checkFilterPredicate('a <=> 1, classOf[Eq[_]], 1)
+          checkFilterPredicate('a =!= 1, classOf[NotEq[_]], (2 to 4).map(Row.apply(_)))
 
-            checkFilterPredicate('a < 2, classOf[Lt[_]], 1)
-            checkFilterPredicate('a > 3, classOf[Gt[_]], 4)
-            checkFilterPredicate('a <= 1, classOf[LtEq[_]], 1)
-            checkFilterPredicate('a >= 4, classOf[GtEq[_]], 4)
+          checkFilterPredicate('a < 2, classOf[Lt[_]], 1)
+          checkFilterPredicate('a > 3, classOf[Gt[_]], 4)
+          checkFilterPredicate('a <= 1, classOf[LtEq[_]], 1)
+          checkFilterPredicate('a >= 4, classOf[GtEq[_]], 4)
 
-            checkFilterPredicate(Literal(1) === 'a, classOf[Eq[_]], 1)
-            checkFilterPredicate(Literal(1) <=> 'a, classOf[Eq[_]], 1)
-            checkFilterPredicate(Literal(2) > 'a, classOf[Lt[_]], 1)
-            checkFilterPredicate(Literal(3) < 'a, classOf[Gt[_]], 4)
-            checkFilterPredicate(Literal(1) >= 'a, classOf[LtEq[_]], 1)
-            checkFilterPredicate(Literal(4) <= 'a, classOf[GtEq[_]], 4)
+          checkFilterPredicate(Literal(1) === 'a, classOf[Eq[_]], 1)
+          checkFilterPredicate(Literal(1) <=> 'a, classOf[Eq[_]], 1)
+          checkFilterPredicate(Literal(2) > 'a, classOf[Lt[_]], 1)
+          checkFilterPredicate(Literal(3) < 'a, classOf[Gt[_]], 4)
+          checkFilterPredicate(Literal(1) >= 'a, classOf[LtEq[_]], 1)
+          checkFilterPredicate(Literal(4) <= 'a, classOf[GtEq[_]], 4)
 
-            checkFilterPredicate(!('a < 4), classOf[GtEq[_]], 4)
-            checkFilterPredicate('a < 2 || 'a > 3, classOf[Operators.Or], Seq(Row(1), Row(4)))
-          }
+          checkFilterPredicate(!('a < 4), classOf[GtEq[_]], 4)
+          checkFilterPredicate('a < 2 || 'a > 3, classOf[Operators.Or], Seq(Row(1), Row(4)))
         }
       }
     }
@@ -1074,20 +1081,20 @@ class ParquetFilterSuite extends QueryTest with ParquetTest with SharedSQLContex
 
       checkFilterPredicate(
         !'_1.startsWith("").asInstanceOf[Predicate],
-        classOf[UserDefinedByInstance[_, _]],
+        classOf[Operators.Not],
         Seq().map(Row(_)))
 
       Seq("2", "2s", "2st", "2str", "2str2").foreach { prefix =>
         checkFilterPredicate(
           !'_1.startsWith(prefix).asInstanceOf[Predicate],
-          classOf[UserDefinedByInstance[_, _]],
+          classOf[Operators.Not],
           Seq("1str1", "3str3", "4str4").map(Row(_)))
       }
 
       Seq("2S", "null", "2str22").foreach { prefix =>
         checkFilterPredicate(
           !'_1.startsWith(prefix).asInstanceOf[Predicate],
-          classOf[UserDefinedByInstance[_, _]],
+          classOf[Operators.Not],
           Seq("1str1", "2str2", "3str3", "4str4").map(Row(_)))
       }
 

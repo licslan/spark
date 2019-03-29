@@ -38,6 +38,18 @@ abstract class ExecSubqueryExpression extends PlanExpression[SubqueryExec] {
   def updateResult(): Unit
 }
 
+object ExecSubqueryExpression {
+  /**
+   * Returns true when an expression contains a subquery
+   */
+  def hasSubquery(e: Expression): Boolean = {
+    e.find {
+      case _: ExecSubqueryExpression => true
+      case _ => false
+    }.isDefined
+  }
+}
+
 /**
  * A subquery that will return only one row and one column.
  *
@@ -51,7 +63,7 @@ case class ScalarSubquery(
   override def dataType: DataType = plan.schema.fields.head.dataType
   override def children: Seq[Expression] = Nil
   override def nullable: Boolean = true
-  override def toString: String = plan.simpleString
+  override def toString: String = plan.simpleString(SQLConf.get.maxToStringFields)
   override def withNewPlan(query: SubqueryExec): ScalarSubquery = copy(plan = query)
 
   override def semanticEquals(other: Expression): Boolean = other match {
@@ -113,7 +125,7 @@ case class PlanSubqueries(sparkSession: SparkSession) extends Rule[SparkPlan] {
 case class ReuseSubquery(conf: SQLConf) extends Rule[SparkPlan] {
 
   def apply(plan: SparkPlan): SparkPlan = {
-    if (!conf.exchangeReuseEnabled) {
+    if (!conf.subqueryReuseEnabled) {
       return plan
     }
     // Build a hash map using schema of subqueries to avoid O(N*N) sameResult calls.
